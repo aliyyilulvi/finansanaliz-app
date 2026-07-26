@@ -3,28 +3,23 @@
 data_fetcher.py
 ----------------
 FinansAnaliz uygulamasının veri toplama katmanı.
-Veri kaynağı: football-data.org REST API'si (ücretsiz plan).
+Veri kaynağı: API-Football (api-football.com) - 1200+ lig, MLS dahil.
 
-API ANAHTARI: Mobilde ortam değişkeni çalışmadığı için _HARDCODED_API_KEY'e gömülüdür.
+MİMARİ: API-Football'ın kendi "hazır tahmini" yerine, GERÇEK takım
+istatistiklerini (/teams/statistics -> maç başına ort. gol) çekip
+KENDİ kanıtlanmış Poisson motorumuza (analyzer.py) besliyoruz. Böylece
+hem geniş lig kapsamı hem Kolik'teki gibi TAM pazar analizi bir arada.
 
-AĞ / DNS NOTU: Sistem DNS çözümleyicisi bazı cihazlarda bozuk olabiliyor.
-Sırasıyla 3 yedek yöntem deneniyor: Android native (pyjnius), DNS-over-TCP,
-Cloudflare DoH.
-
-Her lig AYRI AYRI, kanıtlanmış çalışan /v4/competitions/{code}/matches uç
-noktasıyla PARALEL sorgulanır (genel /v4/matches uç noktası bazı durumlarda
-400 hatası veriyordu).
+ÖNEMLİ: Ücretsiz planda GÜNDE SADECE 100 İSTEK var (dakika değil, gün).
+Bülten: 1 istek. Her analiz: 2 istek (ev+deplasman istatistiği).
 """
 
 import os
-import csv
 import socket
 import struct
 import random
-import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import List, Optional
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 import urllib3.util.connection as _urllib3_cn
@@ -67,7 +62,6 @@ def _parse_dns_response(data: bytes) -> list:
     while data[idx] != 0:
         idx += data[idx] + 1
     idx += 5
-
     ips = []
     for _ in range(ancount):
         if data[idx] & 0xC0 == 0xC0:
@@ -89,18 +83,15 @@ def _resolve_via_dns_tcp(hostname: str, dns_server: str = "8.8.8.8", port: int =
     try:
         query = _build_dns_query(hostname)
         tcp_query = struct.pack(">H", len(query)) + query
-
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(timeout)
         try:
             sock.connect((dns_server, port))
             sock.sendall(tcp_query)
-
             length_bytes = sock.recv(2)
             if len(length_bytes) < 2:
                 return []
             resp_length = struct.unpack(">H", length_bytes)[0]
-
             resp_data = b""
             while len(resp_data) < resp_length:
                 chunk = sock.recv(resp_length - len(resp_data))
@@ -109,7 +100,6 @@ def _resolve_via_dns_tcp(hostname: str, dns_server: str = "8.8.8.8", port: int =
                 resp_data += chunk
         finally:
             sock.close()
-
         return _parse_dns_response(resp_data)
     except Exception as e:
         _last_dns_debug.append(f"dns_tcp: {type(e).__name__}: {e}")
@@ -159,191 +149,130 @@ socket.getaddrinfo = _patched_getaddrinfo
 
 from models import MatchResult, TeamStats, HeadToHead, WeatherInfo, Fixture
 
-FOOTBALL_DATA_BASE = "https://api.football-data.org/v4"
+API_BASE = "https://v3.football.api-sports.io"
 OPEN_METEO_BASE = "https://api.open-meteo.com/v1/forecast"
 GEOCODE_BASE = "https://geocoding-api.open-meteo.com/v1/search"
 
-_HARDCODED_API_KEY = "6fdc17feb0d5436782e4382f3a1daa86"
-
-
-def _api_key() -> str:
-    key = _HARDCODED_API_KEY or os.environ.get("FOOTBALL_DATA_API_KEY", "")
-    if not key:
-        raise RuntimeError(
-            "FOOTBALL_DATA_API_KEY tanımlı değil. Ücretsiz anahtar için: "
-            "https://www.football-data.org/client/register"
-        )
-    return key
+_HARDCODED_API_KEY = "b7e3704ff369331fc8d57a5d6036a067"
 
 
 def _headers() -> dict:
-    return {"X-Auth-Token": _api_key()}
+    return {"x-apisports-key": _HARDCODED_API_KEY}
 
 
-def _get_with_retry(url: str, params: dict = None, max_retries: int = 3, timeout: float = 15) -> requests.Response:
-    last_resp = None
-    for attempt in range(max_retries):
-        resp = requests.get(url, headers=_headers(), params=params, timeout=timeout)
-        if resp.status_code != 429:
-            return resp
-        last_resp = resp
-        wait = int(resp.headers.get("Retry-After", 8))
-        time.sleep(max(wait, 3))
-    return last_resp
-
-
-FREE_COMPETITIONS = ["PL", "PD", "BL1", "SA", "FL1", "CL", "ELC", "DED", "PPL", "BSA", "WC", "EC"]
-
-
-def _fetch_one_competition(comp_code: str, date_from: Optional[str], date_to: Optional[str]) -> List[dict]:
+def _get(url: str, params: dict = None, timeout: float = 15):
     try:
-        url = f"{FOOTBALL_DATA_BASE}/competitions/{comp_code}/matches"
-        params = {}
-        if date_from:
-            params["dateFrom"] = date_from
-        if date_to:
-            params["dateTo"] = date_to
-
-        resp = _get_with_retry(url, params)
-        if resp is None or resp.status_code != 200:
-            return []
-
-        data = resp.json()
-        comp_name = data.get("competition", {}).get("name", comp_code)
-
-        results = []
-        for m in data.get("matches", []):
-            status = m.get("status", "SCHEDULED")
-            full_time = (m.get("score") or {}).get("fullTime") or {}
-            half_time = (m.get("score") or {}).get("halfTime") or {}
-            results.append({
-                "home": m["homeTeam"]["name"],
-                "away": m["awayTeam"]["name"],
-                "home_id": m["homeTeam"]["id"],
-                "away_id": m["awayTeam"]["id"],
-                "utc_date": m["utcDate"],
-                "league": comp_name,
-                "status": status,
-                "home_goals": full_time.get("home"),
-                "away_goals": full_time.get("away"),
-                "ht_home_goals": half_time.get("home"),
-                "ht_away_goals": half_time.get("away"),
-            })
-        return results
-    except Exception:
-        return []
+        return requests.get(url, headers=_headers(), params=params, timeout=timeout)
+    except Exception as e:
+        raise RuntimeError(f"Baglanti hatasi: {type(e).__name__}: {e}")
 
 
 # ----------------------------------------------------------------------
-# 1) FİKSTÜR (Bülten) ÇEKME - PARALEL
+# 1) FİKSTÜR (Bülten) ÇEKME - TEK İSTEKLE TÜM LİGLER (1200+)
 # ----------------------------------------------------------------------
-def fetch_upcoming_fixtures(competition_code: str = "", limit: int = 80,
+def fetch_upcoming_fixtures(competition_code: str = "", limit: int = 100,
                              date_from: Optional[str] = None, date_to: Optional[str] = None) -> List[dict]:
-    code = (competition_code or "").strip().upper()
-    codes = [code] if code else FREE_COMPETITIONS
+    date_str = date_from or date_to or datetime.utcnow().strftime("%Y-%m-%d")
 
-    all_fixtures = []
-    with ThreadPoolExecutor(max_workers=6) as executor:
-        future_map = {
-            executor.submit(_fetch_one_competition, c, date_from, date_to): c
-            for c in codes
-        }
-        for future in as_completed(future_map):
-            try:
-                all_fixtures.extend(future.result())
-            except Exception:
-                continue
+    resp = _get(f"{API_BASE}/fixtures", params={"date": date_str})
+    if resp.status_code != 200:
+        raise RuntimeError(f"Fikstur alinamadi: HTTP {resp.status_code} - {resp.text[:200]}")
 
-    all_fixtures.sort(key=lambda fx: fx["utc_date"])
-    return all_fixtures[:limit]
+    payload = resp.json()
+    matches = payload.get("response", [])
+
+    fixtures = []
+    for m in matches:
+        fixture_info = m.get("fixture", {})
+        league_info = m.get("league", {})
+        teams = m.get("teams", {})
+        goals = m.get("goals", {})
+
+        status_short = (fixture_info.get("status") or {}).get("short", "NS")
+        is_finished = status_short in ("FT", "AET", "PEN")
+        status = "FINISHED" if is_finished else "SCHEDULED"
+
+        fixtures.append({
+            "fixture_id": fixture_info.get("id"),
+            "home": (teams.get("home") or {}).get("name", "?"),
+            "away": (teams.get("away") or {}).get("name", "?"),
+            "home_id": (teams.get("home") or {}).get("id"),
+            "away_id": (teams.get("away") or {}).get("id"),
+            "league_id": league_info.get("id"),
+            "season": league_info.get("season"),
+            "utc_date": fixture_info.get("date", ""),
+            "league": league_info.get("name", ""),
+            "status": status,
+            "home_goals": goals.get("home"),
+            "away_goals": goals.get("away"),
+            "ht_home_goals": ((m.get("score") or {}).get("halftime") or {}).get("home"),
+            "ht_away_goals": ((m.get("score") or {}).get("halftime") or {}).get("away"),
+        })
+
+    fixtures.sort(key=lambda fx: fx.get("utc_date", ""))
+    return fixtures[:limit]
 
 
 # ----------------------------------------------------------------------
-# 2) TAKIM FORMU (son 5 genel, son 3 ev/deplasman)
+# 2) TAKIM İSTATİSTİKLERİ - /teams/statistics (gerçek sezon ortalaması)
 # ----------------------------------------------------------------------
-def fetch_team_recent_matches(team_id: int, limit: int = 10) -> List[MatchResult]:
-    today = datetime.utcnow().date()
-    date_from = (today - timedelta(days=220)).isoformat()
-    date_to = today.isoformat()
+def build_team_stats(team_name: str, team_id: int, league_id: int = None, season: int = None) -> TeamStats:
+    stats = TeamStats(name=team_name)
 
-    url = f"{FOOTBALL_DATA_BASE}/teams/{team_id}/matches"
-    params = {"status": "FINISHED", "dateFrom": date_from, "dateTo": date_to}
-    resp = _get_with_retry(url, params)
-    if resp is None or resp.status_code != 200:
-        return []
-    data = resp.json()
+    if not team_id or not league_id or not season:
+        return stats
 
-    matches_raw = data.get("matches", [])
-    matches_raw = matches_raw[-limit:] if len(matches_raw) > limit else matches_raw
+    try:
+        resp = _get(f"{API_BASE}/teams/statistics",
+                     params={"team": team_id, "league": league_id, "season": season})
+        if resp.status_code != 200:
+            return stats
 
-    results = []
-    for m in matches_raw:
-        is_home = m["homeTeam"]["id"] == team_id
-        gf = m["score"]["fullTime"]["home"] if is_home else m["score"]["fullTime"]["away"]
-        ga = m["score"]["fullTime"]["away"] if is_home else m["score"]["fullTime"]["home"]
-        if gf is None or ga is None:
-            continue
-        opponent = m["awayTeam"]["name"] if is_home else m["homeTeam"]["name"]
-        results.append(MatchResult(
-            opponent=opponent, home=is_home,
-            goals_for=gf, goals_against=ga, date=m.get("utcDate", "")
-        ))
-    results.sort(key=lambda r: r.date, reverse=True)
-    return results
+        data = resp.json().get("response", {})
+        if not data:
+            return stats
 
+        fixtures_played = (data.get("fixtures", {}) or {}).get("played", {}) or {}
+        played_total = fixtures_played.get("total", 0) or 0
 
-def build_team_stats(team_name: str, team_id: int) -> TeamStats:
-    all_recent = fetch_team_recent_matches(team_id, limit=10)
-    last5 = all_recent[:5]
-    home_or_away_specific = [m for m in all_recent if m.home][:3]
+        goals_for = (data.get("goals", {}) or {}).get("for", {}) or {}
+        goals_against = (data.get("goals", {}) or {}).get("against", {}) or {}
 
-    stats = TeamStats(name=team_name, last5_all=last5, last3_home_or_away=home_or_away_specific)
-    stats.squad_market_value_eur = load_market_value(team_name)
+        avg_for = (goals_for.get("average", {}) or {}).get("total")
+        avg_against = (goals_against.get("average", {}) or {}).get("total")
+
+        if avg_for is not None:
+            stats.season_avg_goals_for = float(avg_for)
+        if avg_against is not None:
+            stats.season_avg_goals_against = float(avg_against)
+
+        wins = (data.get("fixtures", {}) or {}).get("wins", {}).get("total", 0) or 0
+        draws = (data.get("fixtures", {}) or {}).get("draws", {}).get("total", 0) or 0
+        if played_total > 0:
+            max_points = played_total * 3
+            actual_points = wins * 3 + draws
+            stats.season_form_score = actual_points / max_points if max_points else 0.5
+
+    except Exception:
+        pass
+
     return stats
 
 
+def fetch_team_recent_matches(team_id: int, limit: int = 10) -> List[MatchResult]:
+    return []
+
+
 def fetch_head_to_head(match_id: int, limit: int = 5) -> HeadToHead:
-    url = f"{FOOTBALL_DATA_BASE}/matches/{match_id}/head2head"
-    params = {"limit": limit}
-    resp = _get_with_retry(url, params)
-    if resp is None or resp.status_code != 200:
-        return HeadToHead(matches=[])
-    data = resp.json()
-
-    matches = []
-    for m in data.get("matches", []):
-        matches.append({
-            "home_team": m["homeTeam"]["name"],
-            "away_team": m["awayTeam"]["name"],
-            "home_goals": m["score"]["fullTime"]["home"],
-            "away_goals": m["score"]["fullTime"]["away"],
-            "date": m.get("utcDate", ""),
-        })
-    return HeadToHead(matches=matches)
-
-
-# ----------------------------------------------------------------------
-# 3) KADRO PİYASA DEĞERİ
-# ----------------------------------------------------------------------
-_MARKET_VALUE_CSV = os.path.join(os.path.dirname(__file__), "data", "market_values.csv")
+    return HeadToHead(matches=[])
 
 
 def load_market_value(team_name: str) -> float:
-    if not os.path.exists(_MARKET_VALUE_CSV):
-        return 0.0
-    with open(_MARKET_VALUE_CSV, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            if row["team_name"].strip().lower() == team_name.strip().lower():
-                try:
-                    return float(row["market_value_eur"])
-                except (ValueError, KeyError):
-                    return 0.0
     return 0.0
 
 
 # ----------------------------------------------------------------------
-# 4) HAVA DURUMU
+# 3) HAVA DURUMU
 # ----------------------------------------------------------------------
 def fetch_city_coordinates(city_name: str) -> Optional[dict]:
     resp = requests.get(GEOCODE_BASE, params={"name": city_name, "count": 1}, timeout=10)
@@ -385,8 +314,11 @@ def fetch_weather(city_name: str, match_date: str) -> WeatherInfo:
 
 
 def build_fixture(raw_fixture: dict) -> Fixture:
-    home_stats = build_team_stats(raw_fixture["home"], raw_fixture["home_id"])
-    away_stats = build_team_stats(raw_fixture["away"], raw_fixture["away_id"])
+    league_id = raw_fixture.get("league_id")
+    season = raw_fixture.get("season")
+
+    home_stats = build_team_stats(raw_fixture["home"], raw_fixture["home_id"], league_id, season)
+    away_stats = build_team_stats(raw_fixture["away"], raw_fixture["away_id"], league_id, season)
 
     match_date = raw_fixture["utc_date"][:10] if raw_fixture.get("utc_date") else \
         datetime.utcnow().strftime("%Y-%m-%d")
